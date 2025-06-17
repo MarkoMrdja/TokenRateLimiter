@@ -7,4 +7,10 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\TokenRateLimiter.Core\TokenRateLimiter.Core.csproj" />
+    <ProjectReference Include="..\TokenRateLimiter.Integrations\TokenRateLimiter.Integrations.csproj" />
+    <ProjectReference Include="..\TokenRateLimiter.Tiktoken\TokenRateLimiter.Tiktoken.csproj" />
+  </ItemGroup>
+
 </Project>
