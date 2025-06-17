@@ -1,13 +1,24 @@
-﻿using TokenRateLimiter.Core.Options;
-
-namespace TokenRateLimiter.Core.Abstractions;
+﻿namespace TokenRateLimiter.Core.Abstractions;
 
 public interface ITokenEstimator
 {
-    int EstimateInputTokens(string text);
-    int EstimateInputTokens(IEnumerable<string> texts);
-    int EstimateOutputTokens(string inputText, OutputTokenEstimationOptions? options = null);
-    TokenEstimation EstimateTotalTokens(string inputText, OutputTokenEstimationOptions? options = null);
-}
+    /// <summary>
+    /// Estimates total tokens using default 50% output ratio
+    /// </summary>
+    int EstimateTokens(string text);
 
-public record TokenEstimation(int InputTokens, int EstimatedOutputTokens, int EstimatedTotal);
+    /// <summary>
+    /// Estimates total tokens with custom output ratio
+    /// </summary>
+    int EstimateTokens(string text, double outputToInputRatio);
+
+    /// <summary>
+    /// Estimates total tokens for multiple texts
+    /// </summary>
+    int EstimateTokens(IEnumerable<string> texts);
+
+    /// <summary>
+    /// Estimates total tokens for multiple texts with custom ratio
+    /// </summary>
+    int EstimateTokens(IEnumerable<string> texts, double outputToInputRatio);
+}

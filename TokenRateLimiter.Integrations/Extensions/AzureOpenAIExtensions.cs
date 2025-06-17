@@ -21,13 +21,35 @@ public static class AzureOpenAIExtensions
         IEnumerable<ChatMessage> messages,
         CancellationToken cancellationToken = default)
     {
-        // Estimate tokens from the messages
         var inputText = string.Join("", messages.Select(m => m.Content?.ToString() ?? ""));
-        var estimation = estimator.EstimateTotalTokens(inputText);
+        var estimatedTokens = estimator.EstimateTokens(inputText);
 
-        // Use the rate limiter to execute the operation
         return await rateLimiter.ExecuteAsync(
-            estimation.EstimatedTotal,
+            estimatedTokens,
+            async () =>
+            {
+                var clientResult = await chatCompletionTask;
+                return (clientResult, clientResult.Value.Usage.TotalTokenCount);
+            },
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Adds rate limiting to Azure OpenAI ChatClient.CompleteChatAsync calls with custom output ratio.
+    /// </summary>
+    public static async Task<ClientResult<ChatCompletion>> WithRateLimit(
+        this Task<ClientResult<ChatCompletion>> chatCompletionTask,
+        ITokenRateLimiter rateLimiter,
+        ITokenEstimator estimator,
+        IEnumerable<ChatMessage> messages,
+        double outputToInputRatio,
+        CancellationToken cancellationToken = default)
+    {
+        var inputText = string.Join("", messages.Select(m => m.Content?.ToString() ?? ""));
+        var estimatedTokens = estimator.EstimateTokens(inputText, outputToInputRatio);
+
+        return await rateLimiter.ExecuteAsync(
+            estimatedTokens,
             async () =>
             {
                 var clientResult = await chatCompletionTask;
@@ -54,6 +76,23 @@ public static class AzureOpenAIExtensions
     }
 
     /// <summary>
+    /// Adds rate limiting to ChatClient operations with custom output ratio.
+    /// </summary>
+    public static async Task<ClientResult<ChatCompletion>> CompleteChatWithRateLimit(
+        this ChatClient chatClient,
+        IEnumerable<ChatMessage> messages,
+        ITokenRateLimiter rateLimiter,
+        ITokenEstimator estimator,
+        double outputToInputRatio,
+        ChatCompletionOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        return await chatClient
+            .CompleteChatAsync(messages, options, cancellationToken)
+            .WithRateLimit(rateLimiter, estimator, messages, outputToInputRatio, cancellationToken);
+    }
+
+    /// <summary>
     /// Convenience method that returns just the ChatCompletion (unwrapped from ClientResult).
     /// </summary>
     public static async Task<ChatCompletion> CompleteChatWithRateLimitUnwrapped(
@@ -66,6 +105,24 @@ public static class AzureOpenAIExtensions
     {
         var clientResult = await chatClient.CompleteChatWithRateLimit(
             messages, rateLimiter, estimator, options, cancellationToken);
+
+        return clientResult.Value;
+    }
+
+    /// <summary>
+    /// Convenience method that returns just the ChatCompletion with custom output ratio.
+    /// </summary>
+    public static async Task<ChatCompletion> CompleteChatWithRateLimitUnwrapped(
+        this ChatClient chatClient,
+        IEnumerable<ChatMessage> messages,
+        ITokenRateLimiter rateLimiter,
+        ITokenEstimator estimator,
+        double outputToInputRatio,
+        ChatCompletionOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        var clientResult = await chatClient.CompleteChatWithRateLimit(
+            messages, rateLimiter, estimator, outputToInputRatio, options, cancellationToken);
 
         return clientResult.Value;
     }

@@ -23,7 +23,7 @@ public static class TokenRateLimiterExtensions
         Func<Task<(T Result, int ActualTokens)>> operation,
         CancellationToken cancellationToken = default)
     {
-        var estimation = estimator.EstimateTotalTokens(inputText);
-        return await rateLimiter.ExecuteAsync(estimation.EstimatedTotal, operation, cancellationToken);
+        var estimation = estimator.EstimateTokens(inputText);
+        return await rateLimiter.ExecuteAsync(estimation, operation, cancellationToken);
     }
 }

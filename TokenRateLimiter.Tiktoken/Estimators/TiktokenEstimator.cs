@@ -1,8 +1,6 @@
 ﻿using Tiktoken;
 using Tiktoken.Encodings;
 using TokenRateLimiter.Core.Abstractions;
-using TokenRateLimiter.Core.Options;
-using TokenRateLimiter.Core.Utils;
 
 namespace TokenRateLimiter.Tiktoken.Estimators;
 
@@ -13,82 +11,52 @@ namespace TokenRateLimiter.Tiktoken.Estimators;
 public class TiktokenEstimator : ITokenEstimator
 {
     private readonly Encoder _encoder;
-    private readonly Dictionary<ResponseType, double> _responseTypeMultipliers;
+    private readonly int _maxOutputTokens;
 
     /// <summary>
-    /// Creates a new Tiktoken estimator using the O200K_BASE encoding,
-    /// which is used by GPT-4, GPT-4 Turbo, and GPT-4o models.
+    /// Creates a new Tiktoken estimator using O200K_BASE encoding (GPT-4 family).
+    /// Uses 32K max output tokens (suitable for GPT-4.1 models).
     /// </summary>
-    public TiktokenEstimator()
-    {
-        _encoder = new Encoder(new O200KBase());
-        _responseTypeMultipliers = new Dictionary<ResponseType, double>
-        {
-            [ResponseType.Conversational] = 0.3,
-            [ResponseType.Analytical] = 1.2,
-            [ResponseType.Code] = 0.8,
-            [ResponseType.Structured] = 0.4,
-            [ResponseType.Creative] = 1.5
-        };
-    }
+    public TiktokenEstimator() : this(new Encoder(new O200KBase()), 32_768) { }
 
     /// <summary>
-    /// Creates a new Tiktoken estimator with a custom encoder.
+    /// Creates a new Tiktoken estimator with custom settings.
     /// </summary>
     /// <param name="encoder">The Tiktoken encoder to use</param>
-    public TiktokenEstimator(Encoder encoder)
+    /// <param name="maxOutputTokens">Maximum output tokens the model can generate</param>
+    public TiktokenEstimator(Encoder encoder, int maxOutputTokens = 32_768)
     {
         _encoder = encoder ?? throw new ArgumentNullException(nameof(encoder));
-        _responseTypeMultipliers = new Dictionary<ResponseType, double>
-        {
-            [ResponseType.Conversational] = 0.3,
-            [ResponseType.Analytical] = 1.2,
-            [ResponseType.Code] = 0.8,
-            [ResponseType.Structured] = 0.4,
-            [ResponseType.Creative] = 1.5
-        };
+        if (maxOutputTokens <= 0)
+            throw new ArgumentException("Max output tokens must be positive", nameof(maxOutputTokens));
+
+        _maxOutputTokens = maxOutputTokens;
     }
 
-    public int EstimateInputTokens(string text)
+    public int EstimateTokens(string text) => EstimateTokens(text, 0.5);
+
+    public int EstimateTokens(string text, double outputToInputRatio)
     {
         if (string.IsNullOrEmpty(text))
             return 0;
 
-        return _encoder.CountTokens(text);
+        int inputTokens = _encoder.CountTokens(text);
+        int estimatedOutput = (int)Math.Ceiling(inputTokens * outputToInputRatio);
+
+        int boundedOutput = Math.Max(10, Math.Min(estimatedOutput, _maxOutputTokens));
+
+        return inputTokens + boundedOutput;
     }
 
-    public int EstimateInputTokens(IEnumerable<string> texts)
+    public int EstimateTokens(IEnumerable<string> texts) =>
+        EstimateTokens(texts, 0.5);
+
+    public int EstimateTokens(IEnumerable<string> texts, double outputToInputRatio)
     {
         if (texts == null)
             return 0;
 
-        // Combine all texts and count tokens once for efficiency
         string combinedText = string.Join("", texts);
-        return EstimateInputTokens(combinedText);
-    }
-
-    public int EstimateOutputTokens(string inputText, OutputTokenEstimationOptions? options = null)
-    {
-        options ??= new OutputTokenEstimationOptions();
-
-        int inputTokens = EstimateInputTokens(inputText);
-
-        // Base estimation using configured ratio
-        double baseOutputTokens = inputTokens * options.OutputToInputRatio;
-
-        // Apply response type multiplier
-        double responseMultiplier = _responseTypeMultipliers.GetValueOrDefault(options.ResponseType, 0.5);
-        double adjustedOutputTokens = baseOutputTokens * responseMultiplier;
-
-        // Apply bounds
-        int estimatedOutput = (int)Math.Ceiling(adjustedOutputTokens);
-        return Math.Max(options.MinOutputTokens, Math.Min(estimatedOutput, options.MaxOutputTokens));
-    }
-
-    public TokenEstimation EstimateTotalTokens(string inputText, OutputTokenEstimationOptions? options = null)
-    {
-        int inputTokens = EstimateInputTokens(inputText);
-        int outputTokens = EstimateOutputTokens(inputText, options);
-        return new TokenEstimation(inputTokens, outputTokens, inputTokens + outputTokens);
+        return EstimateTokens(combinedText, outputToInputRatio);
     }
 }

@@ -16,7 +16,10 @@ public class TokenRateLimiter : ITokenRateLimiter, IDisposable
     private readonly SemaphoreSlim _reservationLock = new(1, 1);
     private readonly Random _random = new();
 
-    private volatile int _reservedTokens = 0;
+    private int _reservedTokens = 0;
+    private int _cachedHistoricalUsage = 0;
+    private DateTime _lastCleanup = DateTime.MinValue;
+    private readonly TimeSpan _cleanupInterval = TimeSpan.FromSeconds(5);
     private volatile bool _disposed = false;
 
     public TokenRateLimiter(IOptions<TokenRateLimiterOptions> options, ILogger<TokenRateLimiter> logger)
@@ -60,9 +63,15 @@ public class TokenRateLimiter : ITokenRateLimiter, IDisposable
 
     public int GetCurrentUsage()
     {
-        CleanupOldUsageRecords();
-        int historicalUsage = _tokenUsageHistory.Sum(record => record.TokenCount);
-        return historicalUsage + _reservedTokens;
+        var now = DateTime.UtcNow;
+
+        // Only cleanup and recalculate if enough time has passed
+        if (now - _lastCleanup > _cleanupInterval)
+        {
+            CleanupOldUsageRecordsAndUpdateCache(now);
+        }
+
+        return _cachedHistoricalUsage + _reservedTokens;
     }
 
     public int GetReservedTokens() => _reservedTokens;
@@ -73,25 +82,58 @@ public class TokenRateLimiter : ITokenRateLimiter, IDisposable
 
         while (!cancellationToken.IsCancellationRequested)
         {
-            int currentUsage = GetCurrentUsage();
-
-            if (currentUsage + estimatedTokens <= effectiveLimit)
+            await _reservationLock.WaitAsync(cancellationToken);
+            try
             {
-                return;
+                int currentUsage = GetCurrentUsageInternal();
+                if (currentUsage + estimatedTokens <= effectiveLimit)
+                {
+                    return;
+                }
+
+                int tokenDeficit = (currentUsage + estimatedTokens) - effectiveLimit;
+                int waitTimeMs = CalculateAdaptiveWaitTime(currentUsage, tokenDeficit);
+
+                _logger.LogWarning(
+                    "Token rate limit approached. Current usage: {CurrentUsage}, Requested: {RequestedTokens}, " +
+                    "Limit: {EffectiveLimit}. Waiting {WaitTime}ms before retry.",
+                    currentUsage, estimatedTokens, effectiveLimit, waitTimeMs);
+
+                _reservationLock.Release();
+
+                await Task.Delay(waitTimeMs, cancellationToken);
+
+                continue;
             }
-
-            int tokenDeficit = (currentUsage + estimatedTokens) - effectiveLimit;
-            int waitTimeMs = CalculateAdaptiveWaitTime(currentUsage, tokenDeficit);
-
-            _logger.LogWarning(
-                "Token rate limit approached. Current usage: {CurrentUsage}, Requested: {RequestedTokens}, " +
-                "Limit: {EffectiveLimit}. Waiting {WaitTime}ms before retry.",
-                currentUsage, estimatedTokens, effectiveLimit, waitTimeMs);
-
-            await Task.Delay(waitTimeMs, cancellationToken);
+            catch
+            {
+                _reservationLock.Release();
+                throw;
+            }
         }
 
         cancellationToken.ThrowIfCancellationRequested();
+    }
+
+    private int GetCurrentUsageInternal()
+    {
+        return _cachedHistoricalUsage + _reservedTokens;
+    }
+
+    private void CleanupOldUsageRecordsAndUpdateCache(DateTime now)
+    {
+        DateTime cutoffTime = now.AddSeconds(-_options.WindowSeconds);
+
+        while (_tokenUsageHistory.TryPeek(out var oldestRecord) && oldestRecord.Timestamp < cutoffTime)
+        {
+            _tokenUsageHistory.TryDequeue(out _);
+        }
+
+        _cachedHistoricalUsage = _tokenUsageHistory.Sum(record => record.TokenCount);
+        _lastCleanup = now;
+
+        _logger.LogDebug("Cleaned up old usage records. Historical usage: {HistoricalUsage}, Records: {RecordCount}",
+            _cachedHistoricalUsage, _tokenUsageHistory.Count);
     }
 
     private int CalculateAdaptiveWaitTime(int currentUsage, int tokenDeficit)
@@ -126,7 +168,10 @@ public class TokenRateLimiter : ITokenRateLimiter, IDisposable
 
             if (reservation.ActualTokensUsed.HasValue)
             {
-                _tokenUsageHistory.Enqueue(new TokenUsageRecord(DateTime.UtcNow, reservation.ActualTokensUsed.Value));
+                var usageRecord = new TokenUsageRecord(DateTime.UtcNow, reservation.ActualTokensUsed.Value);
+                _tokenUsageHistory.Enqueue(usageRecord);
+
+                _lastCleanup = DateTime.MinValue;
 
                 _logger.LogDebug(
                     "Released reservation of {ReservedTokens} tokens, recorded actual usage of {ActualTokens} tokens",
@@ -141,16 +186,6 @@ public class TokenRateLimiter : ITokenRateLimiter, IDisposable
         finally
         {
             _reservationLock.Release();
-        }
-    }
-
-    private void CleanupOldUsageRecords()
-    {
-        DateTime cutoffTime = DateTime.UtcNow.AddSeconds(-_options.WindowSeconds);
-
-        while (_tokenUsageHistory.TryPeek(out var oldestRecord) && oldestRecord.Timestamp < cutoffTime)
-        {
-            _tokenUsageHistory.TryDequeue(out _);
         }
     }
 
