@@ -12,13 +12,21 @@ public class TokenRateLimiter : ITokenRateLimiter, IDisposable
     private readonly TokenRateLimiterOptions _options;
     private readonly ILogger<TokenRateLimiter> _logger;
 
-    private readonly ConcurrentQueue<TokenUsageRecord> _tokenUsageHistory = new();
-    private readonly SemaphoreSlim _reservationLock = new(1, 1);
+    // Concurrency control
+    private readonly SemaphoreSlim _concurrencyLimiter;
+    private readonly ReaderWriterLockSlim _usageLock = new(LockRecursionPolicy.NoRecursion);
+    private readonly object _reservationLock = new();
     private readonly Random _random = new();
 
-    private int _reservedTokens = 0;
+    // Timeline-based tracking for precision
+    private readonly SortedDictionary<DateTime, int> _tokenUsageTimeline = new();
+    private readonly SortedDictionary<DateTime, int> _requestTimeline = new();
+    private readonly Dictionary<Guid, PendingReservation> _activeReservations = new();
+
+    // Performance optimizations
     private int _cachedHistoricalUsage = 0;
     private DateTime _lastCleanup = DateTime.MinValue;
+    private bool _cacheNeedsRefresh = false;
     private readonly TimeSpan _cleanupInterval = TimeSpan.FromSeconds(5);
     private volatile bool _disposed = false;
 
@@ -26,6 +34,9 @@ public class TokenRateLimiter : ITokenRateLimiter, IDisposable
     {
         _options = options.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        
+        _concurrencyLimiter = new SemaphoreSlim(_options.MaxConcurrentReservations, _options.MaxConcurrentReservations);
+        
         ValidateOptions();
     }
 
@@ -33,107 +44,315 @@ public class TokenRateLimiter : ITokenRateLimiter, IDisposable
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        
+        _concurrencyLimiter = new SemaphoreSlim(_options.MaxConcurrentReservations, _options.MaxConcurrentReservations);
+        
         ValidateOptions();
     }
 
-    public async Task<TokenReservation> ReserveTokensAsync(int estimatedTokens, CancellationToken cancellationToken = default)
+    public async Task<TokenReservation> ReserveTokensAsync(int inputTokens, int estimatedOutputTokens = 0, CancellationToken cancellationToken = default)
     {
         if (_disposed)
             throw new ObjectDisposedException(nameof(TokenRateLimiter));
 
-        if (estimatedTokens <= 0)
-            throw new ArgumentException("Estimated tokens must be positive", nameof(estimatedTokens));
+        if (inputTokens <= 0)
+            throw new ArgumentException("Input tokens must be positive", nameof(inputTokens));
 
-        await WaitForAvailableCapacityAsync(estimatedTokens, cancellationToken);
+        if (estimatedOutputTokens < 0)
+            throw new ArgumentException("Estimated output tokens cannot be negative", nameof(estimatedOutputTokens));
 
-        await _reservationLock.WaitAsync(cancellationToken);
+        // Calculate total estimated tokens with user-defined multiplier
+        int totalEstimatedTokens = CalculateEstimatedTotalTokens(inputTokens, estimatedOutputTokens);
+
+        // Step 1: Acquire concurrency slot
+        await _concurrencyLimiter.WaitAsync(cancellationToken);
+        
         try
         {
-            _reservedTokens += estimatedTokens;
-            _logger.LogDebug("Reserved {EstimatedTokens} tokens, total reserved: {ReservedTokens}",
-                estimatedTokens, _reservedTokens);
+            var reservationId = Guid.NewGuid();
+            var pendingReservation = new PendingReservation(reservationId, totalEstimatedTokens, DateTime.UtcNow);
 
-            return new TokenReservation(estimatedTokens, ReleaseReservationAsync);
+            // Step 2: Wait for capacity (optimistic approach)
+            await WaitForAvailableCapacityAsync(totalEstimatedTokens, cancellationToken);
+
+            // Step 3: Atomic check-and-reserve
+            bool shouldRetry = false;
+            lock (_reservationLock)
+            {
+                // Double-check capacity after acquiring lock
+                if (!HasCapacityInternal(totalEstimatedTokens))
+                {
+                    shouldRetry = true;
+                }
+                else
+                {
+                    // Make the reservation atomically
+                    _activeReservations[reservationId] = pendingReservation;
+                    RecordSuccessfulRequest();
+
+                    _logger.LogDebug("Reserved {EstimatedTokens} tokens (input: {InputTokens}, estimated output: {EstimatedOutput}) with ID {ReservationId}, total active reservations: {ActiveCount}",
+                        totalEstimatedTokens, inputTokens, estimatedOutputTokens, reservationId, _activeReservations.Count);
+                }
+            }
+
+            // Handle retry outside the lock
+            if (shouldRetry)
+            {
+                _concurrencyLimiter.Release();
+                return await ReserveTokensAsync(inputTokens, estimatedOutputTokens, cancellationToken);
+            }
+
+            return new TokenReservation(reservationId, totalEstimatedTokens, inputTokens, ReleaseReservationAsync);
         }
-        finally
+        catch
         {
-            _reservationLock.Release();
+            _concurrencyLimiter.Release();
+            throw;
         }
     }
 
     public int GetCurrentUsage()
     {
-        var now = DateTime.UtcNow;
-
-        // Only cleanup and recalculate if enough time has passed
-        if (now - _lastCleanup > _cleanupInterval)
+        _usageLock.EnterReadLock();
+        try
         {
-            CleanupOldUsageRecordsAndUpdateCache(now);
-        }
+            var now = DateTime.UtcNow;
+            
+            // Only cleanup and recalculate if enough time has passed
+            if (now - _lastCleanup > _cleanupInterval)
+            {
+                // Upgrade to write lock for cleanup
+                _usageLock.ExitReadLock();
+                _usageLock.EnterWriteLock();
+                try
+                {
+                    if (now - _lastCleanup > _cleanupInterval) // Double-check pattern
+                    {
+                        CleanupOldUsageRecordsAndUpdateCache(now);
+                    }
+                }
+                finally
+                {
+                    _usageLock.ExitWriteLock();
+                    _usageLock.EnterReadLock();
+                }
+            }
 
-        return _cachedHistoricalUsage + _reservedTokens;
+            return GetCurrentUsageInternal();
+        }
+        finally
+        {
+            _usageLock.ExitReadLock();
+        }
     }
 
-    public int GetReservedTokens() => _reservedTokens;
+    public int GetReservedTokens()
+    {
+        lock (_reservationLock)
+        {
+            return _activeReservations.Values.Sum(r => r.EstimatedTokens);
+        }
+    }
+
+    public TokenUsageStats GetUsageStats()
+    {
+        _usageLock.EnterReadLock();
+        try
+        {
+            int currentUsage = GetCurrentUsageInternal();
+            int reservedTokens = GetReservedTokens();
+            int availableTokens = Math.Max(0, _options.TokenLimit - _options.SafetyBuffer - currentUsage);
+            
+            lock (_reservationLock)
+            {
+                return new TokenUsageStats(
+                    currentUsage,
+                    reservedTokens,
+                    availableTokens,
+                    _activeReservations.Count,
+                    GetCurrentRequestCount()
+                );
+            }
+        }
+        finally
+        {
+            _usageLock.ExitReadLock();
+        }
+    }
+
+    private int CalculateEstimatedTotalTokens(int inputTokens, int estimatedOutputTokens)
+    {
+        if (estimatedOutputTokens > 0)
+        {
+            // User provided explicit estimate
+            return inputTokens + estimatedOutputTokens;
+        }
+
+        // Apply default estimation strategy
+        if (_options.OutputEstimationStrategy == OutputEstimationStrategy.FixedMultiplier)
+        {
+            return inputTokens + (int)Math.Ceiling(inputTokens * _options.OutputMultiplier);
+        }
+        else if (_options.OutputEstimationStrategy == OutputEstimationStrategy.FixedAmount)
+        {
+            return inputTokens + _options.DefaultOutputTokens;
+        }
+        else
+        {
+            // Conservative approach - assume output equals input
+            return inputTokens * 2;
+        }
+    }
 
     private async Task WaitForAvailableCapacityAsync(int estimatedTokens, CancellationToken cancellationToken)
     {
-        int effectiveLimit = _options.TokenLimit - _options.SafetyBuffer;
+        const int maxRetries = 10;
+        int retryCount = 0;
 
-        while (!cancellationToken.IsCancellationRequested)
+        while (!cancellationToken.IsCancellationRequested && retryCount < maxRetries)
         {
-            await _reservationLock.WaitAsync(cancellationToken);
+            bool hasCapacity;
+            
+            _usageLock.EnterReadLock();
+            try
+            {
+                hasCapacity = HasCapacityInternal(estimatedTokens);
+            }
+            finally
+            {
+                _usageLock.ExitReadLock();
+            }
+
+            if (hasCapacity)
+            {
+                return; // We have capacity
+            }
+
+            // Calculate wait time outside of locks to minimize lock contention
+            int waitTimeMs;
+            _usageLock.EnterReadLock();
             try
             {
                 int currentUsage = GetCurrentUsageInternal();
-                if (currentUsage + estimatedTokens <= effectiveLimit)
-                {
-                    return;
-                }
-
-                int tokenDeficit = (currentUsage + estimatedTokens) - effectiveLimit;
-                int waitTimeMs = CalculateAdaptiveWaitTime(currentUsage, tokenDeficit);
-
-                _logger.LogWarning(
-                    "Token rate limit approached. Current usage: {CurrentUsage}, Requested: {RequestedTokens}, " +
-                    "Limit: {EffectiveLimit}. Waiting {WaitTime}ms before retry.",
-                    currentUsage, estimatedTokens, effectiveLimit, waitTimeMs);
-
-                _reservationLock.Release();
-
-                await Task.Delay(waitTimeMs, cancellationToken);
-
-                continue;
+                int tokenDeficit = (currentUsage + estimatedTokens) - (_options.TokenLimit - _options.SafetyBuffer);
+                waitTimeMs = CalculateAdaptiveWaitTime(currentUsage, tokenDeficit);
             }
-            catch
+            finally
             {
-                _reservationLock.Release();
-                throw;
+                _usageLock.ExitReadLock();
             }
+
+            _logger.LogInformation(
+                "Token rate limit approached. Waiting {WaitTime}ms for capacity. " +
+                "Attempt {Retry}/{MaxRetries}, Requested: {RequestedTokens}",
+                waitTimeMs, retryCount + 1, maxRetries, estimatedTokens);
+
+            await Task.Delay(waitTimeMs, cancellationToken);
+            retryCount++;
+        }
+
+        if (retryCount >= maxRetries)
+        {
+            throw new TimeoutException($"Unable to acquire token capacity after {maxRetries} retries");
         }
 
         cancellationToken.ThrowIfCancellationRequested();
     }
 
+    private bool HasCapacityInternal(int requiredTokens)
+    {
+        // This method assumes we're already in a read lock
+        int currentUsage = GetCurrentUsageInternal();
+        int effectiveLimit = _options.TokenLimit - _options.SafetyBuffer;
+        
+        // Check token capacity
+        bool hasTokenCapacity = currentUsage + requiredTokens <= effectiveLimit;
+        
+        // Check request capacity
+        bool hasRequestCapacity = GetCurrentRequestCount() < _options.MaxRequestsPerMinute;
+
+        return hasTokenCapacity && hasRequestCapacity;
+    }
+
     private int GetCurrentUsageInternal()
     {
-        return _cachedHistoricalUsage + _reservedTokens;
+        // This method assumes we're already in a read lock
+        if (_cacheNeedsRefresh)
+        {
+            _cachedHistoricalUsage = _tokenUsageTimeline.Values.Sum();
+            _cacheNeedsRefresh = false;
+        }
+        
+        int reservedTokens;
+        lock (_reservationLock)
+        {
+            reservedTokens = _activeReservations.Values.Sum(r => r.EstimatedTokens);
+        }
+        
+        return _cachedHistoricalUsage + reservedTokens;
+    }
+
+    private int GetCurrentRequestCount()
+    {
+        var cutoff = DateTime.UtcNow.AddSeconds(-60);
+        return _requestTimeline.Where(kv => kv.Key >= cutoff).Sum(kv => kv.Value);
+    }
+
+    private void RecordSuccessfulRequest()
+    {
+        var now = DateTime.UtcNow;
+        if (_requestTimeline.TryGetValue(now, out var existing))
+        {
+            _requestTimeline[now] = existing + 1;
+        }
+        else
+        {
+            _requestTimeline[now] = 1;
+        }
     }
 
     private void CleanupOldUsageRecordsAndUpdateCache(DateTime now)
     {
-        DateTime cutoffTime = now.AddSeconds(-_options.WindowSeconds);
+        DateTime tokenCutoff = now.AddSeconds(-_options.WindowSeconds);
+        DateTime requestCutoff = now.AddMinutes(-2); // Keep 2 minutes of request history
 
-        while (_tokenUsageHistory.TryPeek(out var oldestRecord) && oldestRecord.Timestamp < cutoffTime)
+        // Clean token timeline and recalculate cache
+        var expiredTokenKeys = _tokenUsageTimeline.Keys.Where(k => k < tokenCutoff).ToList();
+        foreach (var key in expiredTokenKeys)
         {
-            _tokenUsageHistory.TryDequeue(out _);
+            _tokenUsageTimeline.Remove(key);
+        }
+        
+        _cachedHistoricalUsage = _tokenUsageTimeline.Values.Sum();
+        _cacheNeedsRefresh = false;
+
+        // Clean request timeline
+        var expiredRequestKeys = _requestTimeline.Keys.Where(k => k < requestCutoff).ToList();
+        foreach (var key in expiredRequestKeys)
+        {
+            _requestTimeline.Remove(key);
         }
 
-        _cachedHistoricalUsage = _tokenUsageHistory.Sum(record => record.TokenCount);
+        // Clean stale reservations (safety measure)
+        lock (_reservationLock)
+        {
+            var staleReservationCutoff = now.AddMinutes(-10);
+            var staleIds = _activeReservations
+                .Where(kv => kv.Value.CreatedAt < staleReservationCutoff)
+                .Select(kv => kv.Key)
+                .ToList();
+                
+            foreach (var id in staleIds)
+            {
+                _activeReservations.Remove(id);
+                _logger.LogWarning("Removed stale reservation {ReservationId}", id);
+            }
+        }
+
         _lastCleanup = now;
 
-        _logger.LogDebug("Cleaned up old usage records. Historical usage: {HistoricalUsage}, Records: {RecordCount}",
-            _cachedHistoricalUsage, _tokenUsageHistory.Count);
+        _logger.LogDebug("Cleaned up old records. Token usage: {TokenUsage}, Active reservations: {Reservations}, Request entries: {Requests}",
+            _cachedHistoricalUsage, _activeReservations.Count, _requestTimeline.Count);
     }
 
     private int CalculateAdaptiveWaitTime(int currentUsage, int tokenDeficit)
@@ -160,32 +379,59 @@ public class TokenRateLimiter : ITokenRateLimiter, IDisposable
     {
         if (_disposed) return;
 
-        await _reservationLock.WaitAsync();
+        bool reservationFound = false;
+        
         try
         {
-            _reservedTokens -= reservation.ReservedTokens;
-            if (_reservedTokens < 0) _reservedTokens = 0;
-
-            if (reservation.ActualTokensUsed.HasValue)
+            _usageLock.EnterWriteLock();
+            try
             {
-                var usageRecord = new TokenUsageRecord(DateTime.UtcNow, reservation.ActualTokensUsed.Value);
-                _tokenUsageHistory.Enqueue(usageRecord);
+                lock (_reservationLock)
+                {
+                    if (_activeReservations.Remove(reservation.Id))
+                    {
+                        reservationFound = true;
+                        
+                        if (reservation.ActualTokensUsed.HasValue)
+                        {
+                            // Record actual usage in timeline
+                            var now = DateTime.UtcNow;
+                            if (_tokenUsageTimeline.TryGetValue(now, out var existing))
+                            {
+                                _tokenUsageTimeline[now] = existing + reservation.ActualTokensUsed.Value;
+                            }
+                            else
+                            {
+                                _tokenUsageTimeline[now] = reservation.ActualTokensUsed.Value;
+                            }
 
-                _lastCleanup = DateTime.MinValue;
+                            // Mark cache for refresh on next access
+                            _cacheNeedsRefresh = true;
 
-                _logger.LogDebug(
-                    "Released reservation of {ReservedTokens} tokens, recorded actual usage of {ActualTokens} tokens",
-                    reservation.ReservedTokens, reservation.ActualTokensUsed.Value);
+                            _logger.LogDebug(
+                                "Released reservation {ReservationId}: {Reserved} → {Actual} tokens, active reservations: {ActiveCount}",
+                                reservation.Id, reservation.ReservedTokens, reservation.ActualTokensUsed.Value, _activeReservations.Count);
+                        }
+                        else
+                        {
+                            _logger.LogDebug("Released reservation {ReservationId} without usage recording (likely failed request), active reservations: {ActiveCount}",
+                                reservation.Id, _activeReservations.Count);
+                        }
+                    }
+                }
             }
-            else
+            finally
             {
-                _logger.LogDebug("Released reservation of {ReservedTokens} tokens without recording usage",
-                    reservation.ReservedTokens);
+                _usageLock.ExitWriteLock();
             }
         }
         finally
         {
-            _reservationLock.Release();
+            // Always release the concurrency slot if reservation was found
+            if (reservationFound)
+            {
+                _concurrencyLimiter.Release();
+            }
         }
     }
 
@@ -203,6 +449,14 @@ public class TokenRateLimiter : ITokenRateLimiter, IDisposable
             throw new ArgumentException("MinWaitTimeMs must be positive");
         if (_options.MaxWaitTimeMs <= _options.MinWaitTimeMs)
             throw new ArgumentException("MaxWaitTimeMs must be greater than MinWaitTimeMs");
+        if (_options.MaxConcurrentReservations <= 0)
+            throw new ArgumentException("MaxConcurrentReservations must be positive");
+        if (_options.MaxRequestsPerMinute <= 0)
+            throw new ArgumentException("MaxRequestsPerMinute must be positive");
+        if (_options.OutputMultiplier < 0)
+            throw new ArgumentException("OutputMultiplier cannot be negative");
+        if (_options.DefaultOutputTokens < 0)
+            throw new ArgumentException("DefaultOutputTokens cannot be negative");
     }
 
     public void Dispose()
@@ -210,7 +464,8 @@ public class TokenRateLimiter : ITokenRateLimiter, IDisposable
         if (!_disposed)
         {
             _disposed = true;
-            _reservationLock.Dispose();
+            _concurrencyLimiter.Dispose();
+            _usageLock.Dispose();
         }
     }
 }

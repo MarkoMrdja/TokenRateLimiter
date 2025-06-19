@@ -28,17 +28,17 @@ public class TokenRateLimiterTests
 
         // Act
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-        using var reservation = await rateLimiter.ReserveTokensAsync(100);
+        await using var reservation = await rateLimiter.ReserveTokensAsync(100);
         stopwatch.Stop();
 
         // Assert
         stopwatch.ElapsedMilliseconds.Should().BeLessThan(100);
-        reservation.ReservedTokens.Should().Be(100);
-        rateLimiter.GetReservedTokens().Should().Be(100);
+        reservation.ReservedTokens.Should().BeGreaterOrEqualTo(100); // Might include estimated output
+        rateLimiter.GetReservedTokens().Should().BeGreaterOrEqualTo(100);
     }
 
     [Fact]
-    public async Task CompleteAsync_ShouldRecordActualUsageAndReleaseReservation()
+    public async Task RecordActualUsageAndDispose_ShouldRecordUsageAndReleaseReservation()
     {
         // Arrange
         var rateLimiter = new TokenRateLimiter(_options, _logger);
@@ -47,12 +47,98 @@ public class TokenRateLimiterTests
         var reservation = await rateLimiter.ReserveTokensAsync(100);
         var initialReserved = rateLimiter.GetReservedTokens();
 
-        await reservation.CompleteAsync(80);
+        reservation.RecordActualUsage(80);
+        await reservation.DisposeAsync();
 
         // Assert
-        initialReserved.Should().Be(100);
+        initialReserved.Should().BeGreaterOrEqualTo(100);
         rateLimiter.GetReservedTokens().Should().Be(0);
         reservation.ActualTokensUsed.Should().Be(80);
-        reservation.IsDisposed.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task UsingStatement_ShouldAutomaticallyReleaseReservation()
+    {
+        // Arrange
+        var rateLimiter = new TokenRateLimiter(_options, _logger);
+
+        // Act & Assert
+        await using (var reservation = await rateLimiter.ReserveTokensAsync(100))
+        {
+            rateLimiter.GetReservedTokens().Should().BeGreaterOrEqualTo(100);
+            reservation.RecordActualUsage(90);
+        }
+
+        // After disposal
+        rateLimiter.GetReservedTokens().Should().Be(0);
+    }
+
+    [Fact]
+    public async Task MultipleReservations_ShouldTrackCorrectly()
+    {
+        // Arrange
+        var rateLimiter = new TokenRateLimiter(_options, _logger);
+
+        // Act
+        await using var reservation1 = await rateLimiter.ReserveTokensAsync(100);
+        await using var reservation2 = await rateLimiter.ReserveTokensAsync(200);
+
+        // Assert
+        rateLimiter.GetReservedTokens().Should().BeGreaterOrEqualTo(300);
+        
+        reservation1.RecordActualUsage(80);
+        reservation2.RecordActualUsage(180);
+    }
+
+    [Fact]
+    public async Task FailedRequest_WithoutRecordingUsage_ShouldNotAffectUsageStats()
+    {
+        // Arrange
+        var rateLimiter = new TokenRateLimiter(_options, _logger);
+        var initialUsage = rateLimiter.GetCurrentUsage();
+
+        // Act - simulate failed request (no RecordActualUsage call)
+        await using (var reservation = await rateLimiter.ReserveTokensAsync(100))
+        {
+            // Don't call RecordActualUsage - simulates failure
+        }
+
+        // Assert
+        var finalUsage = rateLimiter.GetCurrentUsage();
+        finalUsage.Should().Be(initialUsage); // Usage should be unchanged
+    }
+
+    [Fact]
+    public async Task SuccessfulRequest_WithRecordedUsage_ShouldIncreaseUsageStats()
+    {
+        // Arrange
+        var rateLimiter = new TokenRateLimiter(_options, _logger);
+        var initialUsage = rateLimiter.GetCurrentUsage();
+
+        // Act
+        await using (var reservation = await rateLimiter.ReserveTokensAsync(100))
+        {
+            reservation.RecordActualUsage(120); // More than estimated
+        }
+
+        // Assert
+        var finalUsage = rateLimiter.GetCurrentUsage();
+        finalUsage.Should().BeGreaterThan(initialUsage);
+    }
+
+    [Fact]
+    public async Task ExplicitOutputEstimation_ShouldReserveCorrectAmount()
+    {
+        // Arrange
+        var rateLimiter = new TokenRateLimiter(_options, _logger);
+
+        // Act
+        await using var reservation = await rateLimiter.ReserveTokensAsync(
+            inputTokens: 100, 
+            estimatedOutputTokens: 50);
+
+        // Assert
+        reservation.ReservedTokens.Should().Be(150); // 100 input + 50 output
+        reservation.InputTokens.Should().Be(100);
     }
 }

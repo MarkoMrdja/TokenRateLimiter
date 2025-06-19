@@ -6,6 +6,10 @@ using TokenRateLimiter.Integrations.Extensions;
 
 namespace TokenRateLimiter.Example.Services;
 
+/// <summary>
+/// Demonstrates high-volume concurrent processing - the core value proposition of TokenRateLimiter.
+/// Shows how to process many large documents simultaneously without hitting rate limits.
+/// </summary>
 public class BatchProcessingService
 {
     private readonly AzureOpenAIClient _azureClient;
@@ -53,33 +57,50 @@ public class BatchProcessingService
         stopwatch.Stop();
 
         // Show results
-        Console.WriteLine($"✅ Successfully processed {results.Length} documents");
+        var successfulResults = results.Where(r => r.Summary != null).ToArray();
+        Console.WriteLine($"✅ Successfully processed {successfulResults.Length}/{results.Length} documents");
         Console.WriteLine($"⏱️ Total time: {stopwatch.Elapsed:mm\\:ss}");
-        Console.WriteLine($"📈 Average time per document: {stopwatch.ElapsedMilliseconds / documents.Length}ms");
+        
+        if (successfulResults.Length > 0)
+        {
+            Console.WriteLine($"📈 Average time per document: {stopwatch.ElapsedMilliseconds / successfulResults.Length}ms");
+        }
+        
         Console.WriteLine();
 
-        foreach (var (document, summary) in results)
+        foreach (var (document, summary) in successfulResults)
         {
-            Console.WriteLine($"📄 {document.Title}:");
-            Console.WriteLine($"   Summary: {summary[..Math.Min(100, summary.Length)]}...");
+            if (summary != null)
+            {
+                Console.WriteLine($"📄 {document.Title}:");
+                Console.WriteLine($"   Summary: {summary[..Math.Min(100, summary.Length)]}...");
+            }
         }
     }
 
-    private async Task<(Document Document, string Summary)> ProcessLargeDocumentAsync(Document document)
+    private async Task<(Document Document, string? Summary)> ProcessLargeDocumentAsync(Document document)
     {
-        ChatMessage[] messages = new ChatMessage[]
+        try
         {
-            ChatMessage.CreateSystemMessage("You are a document analyst. Provide a comprehensive summary of the document focusing on key insights, main themes, and important details."),
-            ChatMessage.CreateUserMessage($"Please analyze and summarize this document:\n\nTitle: {document.Title}\n\nContent: {document.Content}")
-        };
+            ChatMessage[] messages = new ChatMessage[]
+            {
+                ChatMessage.CreateSystemMessage("You are a document analyst. Provide a comprehensive summary of the document focusing on key insights, main themes, and important details."),
+                ChatMessage.CreateUserMessage($"Please analyze and summarize this document:\n\nTitle: {document.Title}\n\nContent: {document.Content}")
+            };
 
-        // This is where your library shines: automatic rate limiting for high-token requests
-        var completion = await _azureClient
-            .GetChatClient("gpt-4o")
-            .CompleteChatAsync(messages)
-            .WithRateLimit(_rateLimiter, _estimator, messages);
+            // This is where your library shines: automatic rate limiting for high-token requests
+            var completion = await _azureClient
+                .GetChatClient("gpt-4o")
+                .CompleteChatAsync(messages)
+                .WithRateLimit(_rateLimiter, _estimator, messages);
 
-        return (document, completion.Value.Content[0].Text);
+            return (document, completion.Value.Content[0].Text);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ Failed to process {document.Title}: {ex.Message}");
+            return (document, null);
+        }
     }
 
     private Document[] CreateLargeDocuments()

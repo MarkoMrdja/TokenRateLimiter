@@ -69,13 +69,12 @@ public class ManualReservationService
         else
         {
             // Check current token usage to decide on strategy
-            int currentUsage = _rateLimiter.GetCurrentUsage();
-            int reservedTokens = _rateLimiter.GetReservedTokens();
+            var stats = _rateLimiter.GetUsageStats();
 
-            Console.WriteLine($"   📊 Current usage: {currentUsage} tokens ({reservedTokens} reserved)");
+            Console.WriteLine($"   📊 Current usage: {stats.CurrentUsage} tokens ({stats.ReservedTokens} reserved)");
 
-            // Simple heuristic: if we're using more than 80% of typical capacity, use fallback
-            if (currentUsage > 800_000) // Assuming 1M token limit
+            // Simple heuristic: if we're using more than 80% of available capacity, use fallback
+            if (stats.AvailableTokens < 200_000) // Less than 200k tokens available
             {
                 await ProcessWithFallback(request);
             }
@@ -91,11 +90,10 @@ public class ManualReservationService
         Console.WriteLine($"   🚀 Processing with full analysis");
 
         var fullPrompt = CreateDetailedPrompt(request.Description);
+        var inputTokens = _estimator.EstimateTokens(fullPrompt);
+        var estimatedOutputTokens = (int)(inputTokens * 1.2); // Expect 120% more for detailed analysis
 
-        // Updated to use simplified interface with high output ratio for detailed analysis
-        var fullEstimation = _estimator.EstimateTokens(fullPrompt, 1.2); // 120% output for comprehensive analysis
-
-        using var reservation = await _rateLimiter.ReserveTokensAsync(fullEstimation);
+        await using var reservation = await _rateLimiter.ReserveTokensAsync(inputTokens, estimatedOutputTokens);
 
         try
         {
@@ -108,7 +106,7 @@ public class ManualReservationService
             var chatClient = _azureClient.GetChatClient("gpt-4o");
             var completion = await chatClient.CompleteChatAsync(messages);
 
-            await reservation.CompleteAsync(completion.Value.Usage.TotalTokenCount);
+            reservation.RecordActualUsage(completion.Value.Usage.TotalTokenCount);
 
             Console.WriteLine($"   ✅ Full analysis completed using {completion.Value.Usage.TotalTokenCount} tokens");
             Console.WriteLine($"   📝 Result: {completion.Value.Content[0].Text[..Math.Min(150, completion.Value.Content[0].Text.Length)]}...");
@@ -124,11 +122,10 @@ public class ManualReservationService
         Console.WriteLine($"   🔄 Using fallback strategy (quick summary)");
 
         var simplePrompt = CreateSimplePrompt(request.Description);
+        var inputTokens = _estimator.EstimateTokens(simplePrompt);
+        var estimatedOutputTokens = (int)(inputTokens * 0.3); // Expect 30% more for brief summaries
 
-        // Updated to use simplified interface with low output ratio for quick summaries
-        var simpleEstimation = _estimator.EstimateTokens(simplePrompt, 0.3); // 30% output for brief summaries
-
-        using var reservation = await _rateLimiter.ReserveTokensAsync(simpleEstimation);
+        await using var reservation = await _rateLimiter.ReserveTokensAsync(inputTokens, estimatedOutputTokens);
 
         try
         {
@@ -141,7 +138,7 @@ public class ManualReservationService
             var chatClient = _azureClient.GetChatClient("gpt-4o");
             var completion = await chatClient.CompleteChatAsync(messages);
 
-            await reservation.CompleteAsync(completion.Value.Usage.TotalTokenCount);
+            reservation.RecordActualUsage(completion.Value.Usage.TotalTokenCount);
 
             Console.WriteLine($"   ✅ Quick summary completed using {completion.Value.Usage.TotalTokenCount} tokens");
             Console.WriteLine($"   📝 Result: {completion.Value.Content[0].Text[..Math.Min(150, completion.Value.Content[0].Text.Length)]}...");

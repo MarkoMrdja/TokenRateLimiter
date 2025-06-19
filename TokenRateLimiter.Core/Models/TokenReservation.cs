@@ -2,33 +2,66 @@
 
 public class TokenReservation : IDisposable
 {
-    internal TokenReservation(int reservedTokens, Func<TokenReservation, Task> releaseAction)
-    {
-        ReservedTokens = reservedTokens;
-        _releaseAction = releaseAction;
-    }
+    private readonly Func<TokenReservation, Task> _releaseFunc;
+    private bool _disposed = false;
 
+    public Guid Id { get; }
     public int ReservedTokens { get; }
+    public int InputTokens { get; }
     public int? ActualTokensUsed { get; private set; }
-    public bool IsDisposed { get; private set; }
+    public DateTime CreatedAt { get; }
 
-    private readonly Func<TokenReservation, Task> _releaseAction;
-
-    public async Task CompleteAsync(int actualTokensUsed)
+    internal TokenReservation(Guid id, int reservedTokens, int inputTokens, Func<TokenReservation, Task> releaseFunc)
     {
-        if (IsDisposed) return;
-
-        ActualTokensUsed = actualTokensUsed;
-        await _releaseAction(this);
-        IsDisposed = true;
+        Id = id;
+        ReservedTokens = reservedTokens;
+        InputTokens = inputTokens;
+        CreatedAt = DateTime.UtcNow;
+        _releaseFunc = releaseFunc ?? throw new ArgumentNullException(nameof(releaseFunc));
     }
 
+    /// <summary>
+    /// Records the actual tokens used for this request
+    /// Call this after receiving the LLM response to track accurate usage
+    /// </summary>
+    /// <param name="actualTokensUsed">Total tokens used (input + output)</param>
+    public void RecordActualUsage(int actualTokensUsed)
+    {
+        if (actualTokensUsed < 0)
+            throw new ArgumentException("Actual tokens used cannot be negative", nameof(actualTokensUsed));
+            
+        ActualTokensUsed = actualTokensUsed;
+    }
+
+    /// <summary>
+    /// Records actual usage from common LLM response patterns
+    /// </summary>
+    /// <param name="outputTokens">Output tokens from the response</param>
+    public void RecordActualUsage(int inputTokens, int outputTokens)
+    {
+        if (inputTokens < 0) throw new ArgumentException("Input tokens cannot be negative", nameof(inputTokens));
+        if (outputTokens < 0) throw new ArgumentException("Output tokens cannot be negative", nameof(outputTokens));
+        
+        ActualTokensUsed = inputTokens + outputTokens;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (!_disposed)
+        {
+            _disposed = true;
+            await _releaseFunc(this);
+        }
+    }
+    
+    // Support for using statement without async
     public void Dispose()
     {
-        if (!IsDisposed)
+        if (!_disposed)
         {
-            _ = Task.Run(() => _releaseAction(this));
-            IsDisposed = true;
+            _disposed = true;
+            // Fire and forget for synchronous disposal
+            _ = Task.Run(() => _releaseFunc(this));
         }
     }
 }

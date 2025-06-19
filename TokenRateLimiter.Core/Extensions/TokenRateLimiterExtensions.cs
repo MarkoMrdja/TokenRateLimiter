@@ -5,15 +5,15 @@ namespace TokenRateLimiter.Core.Extensions;
 public static class TokenRateLimiterExtensions
 {
     public static async Task<T> ExecuteAsync<T>(this ITokenRateLimiter rateLimiter,
-        int estimatedTokens,
+        int inputTokens,
         Func<Task<(T Result, int ActualTokens)>> operation,
+        int estimatedOutputTokens = 0,
         CancellationToken cancellationToken = default)
     {
-        using var reservation = await rateLimiter.ReserveTokensAsync(estimatedTokens, cancellationToken);
+        await using var reservation = await rateLimiter.ReserveTokensAsync(inputTokens, estimatedOutputTokens, cancellationToken);
 
         var (result, actualTokens) = await operation();
-        await reservation.CompleteAsync(actualTokens);
-
+        reservation.RecordActualUsage(actualTokens);
         return result;
     }
 
@@ -23,7 +23,7 @@ public static class TokenRateLimiterExtensions
         Func<Task<(T Result, int ActualTokens)>> operation,
         CancellationToken cancellationToken = default)
     {
-        var estimation = estimator.EstimateTokens(inputText);
-        return await rateLimiter.ExecuteAsync(estimation, operation, cancellationToken);
+        var inputTokens = estimator.EstimateTokens(inputText);
+        return await rateLimiter.ExecuteAsync(inputTokens, operation, cancellationToken: cancellationToken);
     }
 }

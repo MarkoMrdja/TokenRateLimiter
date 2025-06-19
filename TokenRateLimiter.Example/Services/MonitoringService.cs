@@ -58,36 +58,36 @@ public class MonitoringService
         Console.WriteLine();
     }
 
-    private async Task ReserveAndUseTokens(int estimated, int actual)
+    private async Task ReserveAndUseTokens(int inputTokens, int actualTotal)
     {
-        using var reservation = await _rateLimiter.ReserveTokensAsync(estimated);
+        var estimatedOutputTokens = (int)(inputTokens * 0.5); // 50% output estimation
+        
+        await using var reservation = await _rateLimiter.ReserveTokensAsync(inputTokens, estimatedOutputTokens);
 
         // Simulate processing time
         await Task.Delay(100);
 
-        await reservation.CompleteAsync(actual);
+        reservation.RecordActualUsage(actualTotal);
     }
 
     private void ShowCurrentStatus(string title)
     {
         Console.WriteLine($"📈 {title}:");
 
-        int currentUsage = _rateLimiter.GetCurrentUsage();
-        int reservedTokens = _rateLimiter.GetReservedTokens();
-        int historicalUsage = currentUsage - reservedTokens;
+        var stats = _rateLimiter.GetUsageStats();
 
-        Console.WriteLine($"   Current Usage: {currentUsage:N0} tokens");
-        Console.WriteLine($"   Reserved Tokens: {reservedTokens:N0} tokens");
-        Console.WriteLine($"   Historical Usage: {historicalUsage:N0} tokens");
+        Console.WriteLine($"   Current Usage: {stats.CurrentUsage:N0} tokens");
+        Console.WriteLine($"   Reserved Tokens: {stats.ReservedTokens:N0} tokens");
+        Console.WriteLine($"   Available Tokens: {stats.AvailableTokens:N0} tokens");
+        Console.WriteLine($"   Active Reservations: {stats.ActiveReservations}");
+        Console.WriteLine($"   Requests/Min: {stats.RequestsInLastMinute}");
 
-        // Simple capacity estimation
+        // Calculate usage percentage
         const int assumedLimit = 1_000_000;
         const int safetyBuffer = 50_000;
         int effectiveLimit = assumedLimit - safetyBuffer;
-        int availableTokens = Math.Max(0, effectiveLimit - currentUsage);
-        double usagePercentage = (double)currentUsage / effectiveLimit * 100;
+        double usagePercentage = (double)stats.CurrentUsage / effectiveLimit * 100;
 
-        Console.WriteLine($"   Available Tokens: {availableTokens:N0} tokens");
         Console.WriteLine($"   Usage Percentage: {usagePercentage:F1}%");
 
         if (usagePercentage > 80)
@@ -95,7 +95,7 @@ public class MonitoringService
             Console.WriteLine("   ⚠️ WARNING: Near rate limit!");
         }
 
-        if (availableTokens <= 0)
+        if (stats.AvailableTokens <= 0)
         {
             Console.WriteLine("   🚨 ALERT: At capacity!");
         }
@@ -116,22 +116,21 @@ public class MonitoringService
 
         foreach (var input in testInputs)
         {
-            // Updated to use simplified interface
-            var totalEstimation = _estimator.EstimateTokens(input); // Default 50% output ratio
-            var customEstimation = _estimator.EstimateTokens(input, 0.8); // 80% output ratio
+            var inputTokens = _estimator.EstimateTokens(input);
             var preview = input.Length > 50 ? input[..50] + "..." : input;
 
             Console.WriteLine($"   Text: \"{preview}\"");
             Console.WriteLine($"   Character count: {input.Length}");
-            Console.WriteLine($"   Total estimated (50% output): {totalEstimation:N0} tokens");
-            Console.WriteLine($"   Total estimated (80% output): {customEstimation:N0} tokens");
+            Console.WriteLine($"   Estimated input tokens: {inputTokens:N0}");
+            Console.WriteLine($"   Total with 50% output: {inputTokens + (int)(inputTokens * 0.5):N0} tokens");
+            Console.WriteLine($"   Total with 80% output: {inputTokens + (int)(inputTokens * 0.8):N0} tokens");
             Console.WriteLine();
         }
 
         // Demonstrate batch estimation
         Console.WriteLine("📦 BATCH ESTIMATION EXAMPLE:");
-        var totalBatchEstimation = _estimator.EstimateTokens(testInputs);
-        Console.WriteLine($"   All texts combined: {totalBatchEstimation:N0} tokens");
+        var totalTokens = testInputs.Sum(text => _estimator.EstimateTokens(text));
+        Console.WriteLine($"   All texts combined: {totalTokens:N0} input tokens");
         Console.WriteLine();
     }
 
